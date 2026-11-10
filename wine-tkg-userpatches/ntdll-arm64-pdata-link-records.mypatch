@@ -1,0 +1,154 @@
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index bfffb1a..727394a 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -606,7 +606,8 @@ static void process_unwind_codes( BYTE *ptr, BYTE *end, ARM64_NT_CONTEXT *contex
+ }
+ 
+ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUNCTION *func,
+-                                 ARM64_NT_CONTEXT *context, KNONVOLATILE_CONTEXT_POINTERS_ARM64 *ptrs )
++                                 ARM64_NT_CONTEXT *context, KNONVOLATILE_CONTEXT_POINTERS_ARM64 *ptrs,
++                                 BOOLEAN island )
+ {
+     int i;
+     unsigned int len, offset;
+@@ -729,7 +730,8 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUN
+     prologue_end = &prologue[ppos];
+     epilogue_end = &epilogue[epos];
+ 
+-    if (func->Flag == 1)
++    /* a jump island is part of the body of its parent: never in its prologue or epilogue */
++    if (func->Flag == 1 && !island)
+     {
+         if (offset < (prologue_end - prologue) || offset >= func->FunctionLength - (epilogue_end - epilogue))
+         {
+@@ -758,7 +760,7 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUN
+ static void *unwind_full_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUNCTION *func,
+                                ARM64_NT_CONTEXT *context, PVOID *handler_data,
+                                KNONVOLATILE_CONTEXT_POINTERS_ARM64 *ptrs,
+-                               BOOLEAN *final_pc_from_lr )
++                               BOOLEAN *final_pc_from_lr, BOOLEAN island )
+ {
+     IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA *info;
+     struct unwind_info_epilog *info_epilog;
+@@ -788,8 +790,8 @@ static void *unwind_full_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUNCT
+            info->FunctionLength, info->Version, info->ExceptionDataPresent, info->EpilogInHeader,
+            epilogs, codes * 4 );
+ 
+-    /* check for prolog */
+-    if (offset < codes * 4)
++    /* check for prolog (a jump island is part of the body of its parent) */
++    if (!island && offset < codes * 4)
+     {
+         len = get_sequence_len( data, end );
+         if (offset < len)
+@@ -800,7 +802,11 @@ static void *unwind_full_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUNCT
+     }
+ 
+     /* check for epilog */
+-    if (!info->EpilogInHeader)
++    if (island)
++    {
++        /* body only */
++    }
++    else if (!info->EpilogInHeader)
+     {
+         for (i = 0; i < epilogs; i++)
+         {
+@@ -840,6 +846,17 @@ static void *unwind_full_data( ULONG_PTR base, ULONG_PTR pc, ARM64_RUNTIME_FUNCT
+     return NULL;
+ }
+ 
++/* length in instructions of the code covered by a .pdata record */
++static ULONG arm64_function_length( ULONG_PTR base, const ARM64_RUNTIME_FUNCTION *func )
++{
++    /* Flag 3 is a link record (jump island), not packed unwind data: UnwindData is the RVA of the
++     * parent .pdata record, so the FunctionLength bitfield is meaningless. Jump islands emitted
++     * by the toolchain are an adrp/add/br sequence. */
++    if (func->Flag == 3) return 3;
++    if (func->Flag) return func->FunctionLength;
++    return ((IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA *)(base + func->UnwindData))->FunctionLength;
++}
++
+ static ARM64_RUNTIME_FUNCTION *find_function_info_arm64( ULONG_PTR pc, ULONG_PTR base,
+                                                          ARM64_RUNTIME_FUNCTION *func, ULONG count )
+ {
+@@ -853,8 +870,7 @@ static ARM64_RUNTIME_FUNCTION *find_function_info_arm64( ULONG_PTR pc, ULONG_PTR
+ 
+         if (pc >= start)
+         {
+-            ULONG len = func[pos].Flag ? func[pos].FunctionLength :
+-                ((IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA *)(base + func[pos].UnwindData))->FunctionLength;
++            ULONG len = arm64_function_length( base, &func[pos] );
+             if (pc < start + 4 * len) return func + pos;
+             min = pos + 1;
+         }
+@@ -880,7 +896,7 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                    ULONG_PTR *limit_low, ULONG_PTR *limit_high,
+                                    PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
+ {
+-    BOOLEAN final_pc_from_lr = TRUE;
++    BOOLEAN final_pc_from_lr = TRUE, island = FALSE, bad_link = FALSE;
+     PEXCEPTION_ROUTINE handler;
+     void *data = NULL;
+ 
+@@ -902,16 +918,32 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+ 
+     __TRY
+     {
+-        if (func->Flag)
+-            handler = unwind_packed_data( base, pc, func, context, ctx_ptr );
+-        else
+-            handler = unwind_full_data( base, pc, func, context, &data, ctx_ptr, &final_pc_from_lr );
++        if (func->Flag == 3)
++        {
++            /* link record: pc is in a jump island, which is unwound as part of the body of the
++             * function (or fragment) described by the parent record (no chained links) */
++            ARM64_RUNTIME_FUNCTION *parent = (ARM64_RUNTIME_FUNCTION *)(base + (func->UnwindData & ~3));
++            TRACE( "link record %I64x -> parent %I64x\n", base + func->BeginAddress, base + parent->BeginAddress );
++            if (parent->Flag == 3) bad_link = TRUE;
++            else
++            {
++                func = parent;
++                island = TRUE;
++            }
++        }
++        if (!bad_link)
++        {
++            if (func->Flag)
++                handler = unwind_packed_data( base, pc, func, context, ctx_ptr, island );
++            else
++                handler = unwind_full_data( base, pc, func, context, &data, ctx_ptr, &final_pc_from_lr, island );
+ 
+-        if (final_pc_from_lr) context->Pc = context->Lr;
+-        *frame_ret = context->Sp;
++            if (final_pc_from_lr) context->Pc = context->Lr;
++            *frame_ret = context->Sp;
+ 
+-        if (handler_ret) *handler_ret = handler;
+-        *handler_data = data;
++            if (handler_ret) *handler_ret = handler;
++            *handler_data = data;
++        }
+     }
+     __EXCEPT_PAGE_FAULT
+     {
+@@ -920,6 +952,8 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+     }
+     __ENDTRY
+ 
++    if (bad_link) return STATUS_BAD_FUNCTION_TABLE;  /* a link record cannot point to another link */
++
+     TRACE( "ret: pc=%I64x lr=%I64x sp=%I64x handler=%p\n", context->Pc, context->Lr, context->Sp, handler );
+     return STATUS_SUCCESS;
+ }
+@@ -1053,8 +1087,7 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+     if (count)
+     {
+         RUNTIME_FUNCTION *func = table + count - 1;
+-        ULONG len = func->Flag ? func->FunctionLength :
+-            ((IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY_XDATA *)(base + func->UnwindData))->FunctionLength;
++        ULONG len = arm64_function_length( base, func );
+         end += func->BeginAddress + 4 * len;
+     }
+     return !RtlAddGrowableFunctionTable( &ret, table, count, 0, base, end );
